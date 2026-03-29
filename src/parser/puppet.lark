@@ -1,0 +1,290 @@
+// Puppet DSL Grammar for lark-parser
+// Supports Puppet 3 and Puppet 4+ syntax
+// Parser: Earley (handles ambiguous/complex constructs)
+
+start: statement*
+
+// ── Statements ────────────────────────────────────────────────────────────────
+
+statement: resource_declaration
+         | resource_default
+         | resource_collector
+         | resource_chain
+         | class_definition
+         | class_declaration
+         | include_statement
+         | defined_type_definition
+         | node_definition
+         | variable_assignment
+         | if_statement
+         | unless_statement
+         | case_statement
+         | realize_statement
+         | function_call_stmt
+         | method_call_stmt
+         | import_statement
+
+// ── Resource Declarations ─────────────────────────────────────────────────────
+
+resource_declaration: virtuality resource_type "{" resource_bodies "}"
+
+virtuality: EXPORTED | VIRTUAL |
+EXPORTED: /@@/
+VIRTUAL:  /@(?!@)/
+
+resource_type: LNAME ("::" LNAME)*
+
+resource_bodies: resource_body (";" resource_body)* ";"?
+
+resource_body: resource_title ":" resource_attributes?
+
+resource_title: expression
+
+resource_attributes: resource_attribute ("," resource_attribute)* ","?
+
+resource_attribute: LNAME "=>" expression
+                  | "*" "=>" expression
+
+// Resource defaults (capitalized type, no title)
+resource_default: resource_type_cap "{" resource_attributes? "}"
+
+resource_type_cap: CAPNAME ("::" CAPNAME)*
+
+// ── Resource Collector ────────────────────────────────────────────────────────
+
+resource_collector: resource_type_cap "<|" collection_query? "|>"
+                  | resource_type_cap "<<|" collection_query? "|>>"
+
+collection_query: expression
+
+// ── Resource Chain ────────────────────────────────────────────────────────────
+
+resource_chain: chainable (CHAIN_OP chainable)+
+
+CHAIN_OP: "->" | "~>"
+
+chainable: resource_declaration
+         | resource_reference
+         | resource_collector
+         | class_declaration
+
+// ── Class Definition ──────────────────────────────────────────────────────────
+
+class_definition: "class" class_name class_params? class_inherits? "{" statement* "}"
+
+class_name: LNAME ("::" LNAME)*
+
+class_params: "(" class_parameter_list? ")"
+
+class_parameter_list: class_parameter ("," class_parameter)* ","?
+
+class_parameter: type_expr? VARIABLE ("=" expression)?
+
+class_inherits: "inherits" class_name
+
+// ── Defined Type ──────────────────────────────────────────────────────────────
+
+defined_type_definition: "define" class_name class_params? "{" statement* "}"
+
+// ── Class Declaration ─────────────────────────────────────────────────────────
+
+class_declaration: "class" "{" string_expr ":" resource_attributes? "}"
+
+string_expr: expression
+
+include_statement: "include" include_list
+include_list: include_item ("," include_item)*
+include_item: LNAME ("::" LNAME)*
+
+// ── Node Definition ───────────────────────────────────────────────────────────
+
+node_definition: "node" node_matchers "{" statement* "}"
+
+node_matchers: node_matcher ("," node_matcher)*
+
+node_matcher: ESCAPED_STRING
+            | SQ_STRING
+            | REGEX
+            | "default"
+
+// ── Variable Assignment ───────────────────────────────────────────────────────
+
+variable_assignment: VARIABLE "=" expression
+
+// ── Conditionals ──────────────────────────────────────────────────────────────
+
+if_statement: "if" expression "{" statement* "}" elsif_clause* else_clause?
+
+elsif_clause: "elsif" expression "{" statement* "}"
+
+else_clause: "else" "{" statement* "}"
+
+unless_statement: "unless" expression "{" statement* "}" else_clause?
+
+case_statement: "case" expression "{" case_when+ "}"
+
+case_when: case_matchers ":" "{" statement* "}"
+
+case_matchers: case_matcher ("," case_matcher)*
+
+case_matcher: expression | "default"
+
+// ── Realize ───────────────────────────────────────────────────────────────────
+
+realize_statement: "realize" "(" resource_ref_list ")"
+                 | "realize" resource_reference
+
+resource_ref_list: resource_reference ("," resource_reference)*
+
+// ── Import (Puppet 3) ─────────────────────────────────────────────────────────
+
+import_statement: "import" ESCAPED_STRING
+                | "import" SQ_STRING
+
+// ── Function call as statement ────────────────────────────────────────────────
+
+function_call_stmt: LNAME "(" argument_list? ")"
+
+method_call_stmt: expression "." LNAME "(" argument_list? ")" lambda_block?
+                | expression "." LNAME lambda_block
+
+// ── Expressions ───────────────────────────────────────────────────────────────
+
+?expression: or_expr
+
+?or_expr:    and_expr
+           | or_expr "or" and_expr      -> bin_or
+
+?and_expr:   not_expr
+           | and_expr "and" not_expr    -> bin_and
+
+?not_expr:   compare_expr
+           | "!" not_expr               -> unary_not
+           | "not" not_expr             -> unary_not
+
+?compare_expr: in_expr
+             | compare_expr COMPARE_OP in_expr  -> bin_compare
+
+COMPARE_OP: "==" | "!=" | "<" | ">" | "<=" | ">=" | "=~" | "!~"
+
+?in_expr:    add_expr
+           | in_expr "in" add_expr      -> bin_in
+
+?add_expr:   mul_expr
+           | add_expr "+" mul_expr      -> bin_add
+           | add_expr "-" mul_expr      -> bin_sub
+
+?mul_expr:   unary_expr
+           | mul_expr "*" unary_expr    -> bin_mul
+           | mul_expr "/" unary_expr    -> bin_div
+           | mul_expr "%" unary_expr    -> bin_mod
+
+?unary_expr: access_expr
+           | "-" unary_expr             -> unary_neg
+           | "!" unary_expr             -> unary_not
+
+?access_expr: primary_expr
+            | access_expr "[" expression "]"     -> array_access
+            | access_expr "." LNAME "(" argument_list? ")" lambda_block?  -> method_call
+            | access_expr "." LNAME lambda_block  -> method_call_noarg
+            | access_expr "." LNAME               -> attr_access
+            | access_expr "?" "{" selector_cases "}"  -> selector_expr
+
+?primary_expr: literal
+             | VARIABLE                 -> variable_expr
+             | resource_reference
+             | function_call
+             | type_cast
+             | "(" expression ")"
+             | array_expr
+             | hash_expr
+             | type_expr               -> type_ref
+
+// ── Literals ──────────────────────────────────────────────────────────────────
+
+literal: ESCAPED_STRING   -> dq_string
+       | SQ_STRING        -> sq_string
+       | NUMBER           -> number
+       | "true"           -> bool_true
+       | "false"          -> bool_false
+       | "undef"          -> undef_lit
+       | REGEX            -> regex_lit
+       | BAREWORD         -> bareword
+
+// Bare words: unquoted identifiers used as values (present, absent, installed, running, etc.)
+// Must not be keywords — handled by priority
+BAREWORD.0: /(?!(true|false|undef|if|elsif|else|unless|case|class|define|node|include|require|realize|import|and|or|not|in|inherits)\b)[a-z_][a-zA-Z0-9_]*/
+
+array_expr: "[" (expression ("," expression)* ","?)? "]"
+
+hash_expr: "{" (hash_pair ("," hash_pair)* ","?)? "}"
+
+hash_pair: expression "=>" expression
+
+// ── Variables ─────────────────────────────────────────────────────────────────
+
+VARIABLE: /\$(?:::)?[a-zA-Z_][a-zA-Z0-9_]*(?:::[a-zA-Z_][a-zA-Z0-9_]*)*/
+
+// ── Resource Reference ────────────────────────────────────────────────────────
+
+resource_reference: resource_type_cap "[" expression "]"
+
+// ── Function Call ─────────────────────────────────────────────────────────────
+
+function_call: LNAME "(" argument_list? ")" lambda_block?
+
+argument_list: expression ("," expression)* ","?
+
+lambda_block: "|" lambda_params? "|" "{" statement* "}"
+
+lambda_params: lambda_param ("," lambda_param)* ","?
+
+lambda_param: type_expr? VARIABLE
+
+// ── Selector Expression (Puppet ternary) ─────────────────────────────────────
+// selector_expr is handled inline in access_expr above
+
+selector_cases: selector_case ("," selector_case)* ","?
+
+selector_case: (expression | "default") "=>" expression
+
+// ── Type Expressions ──────────────────────────────────────────────────────────
+
+type_cast: CAPNAME "(" expression ")"
+
+type_expr: CAPNAME ("[" type_params "]")?
+
+type_params: type_param ("," type_param)* ","?
+
+type_param: type_expr | expression | "default"
+
+// ── Tokens ───────────────────────────────────────────────────────────────────
+
+// Lowercase name (rule names, attribute names, function names)
+// Excludes all Puppet keywords so they don't match as resource types or function names
+// Exclude only true statement-level Puppet keywords that would cause ambiguity
+// NOT excluded: require, notify, subscribe, before (metaparameters), or function names
+LNAME.1: /(?!(class|define|node|include|realize|import|inherits|if|elsif|else|unless|case|and|or|not|in|true|false|undef)\b)[a-z_][a-zA-Z0-9_]*/
+
+// Capitalized name (type names, class names in references)
+CAPNAME: /[A-Z][a-zA-Z0-9_]*/
+
+// Double-quoted string (with possible interpolation)
+ESCAPED_STRING: /\"(\\.|[^\"\\])*\"/
+
+// Single-quoted string (no interpolation)
+SQ_STRING: /\'(\\.|[^\'\\])*\'/
+
+// Number (integer or float)
+NUMBER: /[0-9]+(\.[0-9]+)?/
+
+// Regex literal /pattern/
+REGEX: /\/(?:[^\/\\]|\\.)+\//
+
+// Comments (ignored)
+COMMENT:    /#[^\n]*/
+ML_COMMENT: /\/\*.*?\*\//s
+
+%ignore COMMENT
+%ignore ML_COMMENT
+%ignore /\s+/
