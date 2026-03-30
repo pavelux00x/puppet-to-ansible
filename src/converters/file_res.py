@@ -27,7 +27,23 @@ class FileConverter(BaseConverter):
         body: ResourceBody,
         context: ConversionContext,
     ) -> list[dict[str, Any]]:
-        title  = str(self.resolve_title(body, context))
+        titles = self.resolve_title(body, context)
+        # Puppet allows an array of paths as the resource title:
+        #   file { [$dir1, $dir2]: ensure => directory }
+        # Each path becomes its own Ansible task.
+        if isinstance(titles, list):
+            tasks = []
+            for t in titles:
+                tasks.extend(self._convert_single(str(t), body, context))
+            return tasks
+        return self._convert_single(str(titles), body, context)
+
+    def _convert_single(
+        self,
+        title: str,
+        body: ResourceBody,
+        context: ConversionContext,
+    ) -> list[dict[str, Any]]:
         notify = self.get_notify(body, context)
         when   = self.get_when(body, context)
 

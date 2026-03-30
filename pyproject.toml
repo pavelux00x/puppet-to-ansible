@@ -21,6 +21,10 @@ lint = [
     "yamllint>=1.35",
 ]
 
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+
 [project.scripts]
 p2a = "src.cli:main"
 

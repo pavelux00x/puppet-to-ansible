@@ -130,28 +130,36 @@ class BaseConverter(ABC):
                 key = self.resolve(fn.arguments[0], context)
                 key_str = str(key)
 
+                # Extract the inline default regardless of whether Hiera data is available:
+                #   hiera('key', default)        → 2nd arg
+                #   lookup('key', _, _, default) → 4th arg
+                hiera_default = None
+                if name == "hiera" and len(fn.arguments) >= 2:
+                    hiera_default = self.resolve(fn.arguments[1], context)
+                elif name == "lookup" and len(fn.arguments) >= 4:
+                    hiera_default = self.resolve(fn.arguments[3], context)
+
                 # --- Hiera live resolution (when a HieraAwareScope is available) ---
+                # Do NOT pass the inline default here — we want to distinguish
+                # "Hiera has the key" from "Hiera is absent, use the inline default".
                 if getattr(context, "hiera_scope", None) is not None:
-                    # Determine merge strategy from lookup()'s 3rd arg
                     merge = "first"
                     if name == "lookup" and len(fn.arguments) >= 3:
                         merge_arg = self.resolve(fn.arguments[2], context)
                         if isinstance(merge_arg, str):
                             merge = merge_arg
 
-                    # Determine default from hiera(key, default) or lookup(key, _, _, default)
-                    hiera_default = None
-                    if name == "hiera" and len(fn.arguments) >= 2:
-                        hiera_default = self.resolve(fn.arguments[1], context)
-                    elif name == "lookup" and len(fn.arguments) >= 4:
-                        hiera_default = self.resolve(fn.arguments[3], context)
-
-                    resolved = context.hiera_scope.get(key_str, default=hiera_default, merge=merge)
+                    resolved = context.hiera_scope.get(key_str, default=None, merge=merge)
                     if resolved is not None:
                         return resolved
 
                 # --- Fallback: emit as Jinja2 variable reference ---
+                # If there is an inline default (hiera('key', default)), save it so
+                # it ends up in defaults/main.yml — the playbook stays runnable without
+                # a Hiera data directory.
                 var_name = key_str.replace("::", "_").replace("-", "_").replace(".", "_")
+                if hiera_default is not None and hasattr(context, "hiera_defaults"):
+                    context.hiera_defaults.setdefault(var_name, hiera_default)
                 return f"{{{{ {var_name} }}}}"
             return "{{ undefined }}"
         if name == "template":
@@ -281,6 +289,9 @@ class ConversionContext:
         self._handler_names:  set[str] = set()
         # Optional Hiera-aware scope (set by ManifestConverter after init)
         self.hiera_scope: Any = None
+        # Defaults extracted from hiera('key', default) when no Hiera data is available.
+        # These are written to defaults/main.yml so the playbook still works out of the box.
+        self.hiera_defaults: dict[str, Any] = {}
 
     @property
     def current_when(self) -> str | None:

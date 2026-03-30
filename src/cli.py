@@ -9,6 +9,8 @@ Usage examples:
     p2a convert-all /etc/puppet/ --module-paths /etc/puppet/modules --hiera /etc/puppet/hiera.yaml -o ansible-project/ --report report.md
     p2a convert-erb templates/nginx.conf.erb -o roles/nginx/templates/
     p2a convert-hiera /etc/puppet/hieradata/ -o inventory/
+    p2a analyze-puppetfile Puppetfile
+    p2a analyze-puppetfile Puppetfile --report puppetfile-report.md
 """
 from __future__ import annotations
 
@@ -341,10 +343,11 @@ def convert_all_cmd(
     console.print()
 
     # ── Auto-discover structure ──────────────────────────────────────────────
-    modules_dirs = list(module_paths) or _autodiscover_modules(base, verbose)
-    hiera_file   = Path(hiera) if hiera else _autodiscover_hiera(base, verbose)
+    modules_dirs  = list(module_paths) or _autodiscover_modules(base, verbose)
+    hiera_file    = Path(hiera) if hiera else _autodiscover_hiera(base, verbose)
     hieradata_dir = _autodiscover_hieradata(base, hiera_file, verbose)
     site_pp       = _autodiscover_site_pp(base, verbose)
+    puppetfile    = _autodiscover_puppetfile(base, verbose)
 
     # Build Hiera resolver once (shared across all conversions)
     hiera_res: HieraResolver | None = None
@@ -417,7 +420,27 @@ def convert_all_cmd(
         converted = hc.convert_dir(hieradata_dir, out / "inventory")
         console.print(f"  [green]✓[/green] {len(converted)} Hiera file(s) converted")
 
-    # ── 4. Global requirements.yml ───────────────────────────────────────────
+    # ── 4. Puppetfile → requirements.yml (merge with converter output) ───────
+    if puppetfile:
+        console.print(f"\n[bold]Puppetfile → Galaxy collections[/bold]")
+        from src.puppetfile.parser import PuppetfileParser
+        from src.puppetfile.mapper import PuppetfileMapper
+        pf_parsed = PuppetfileParser().parse_file(puppetfile)
+        pf_report = PuppetfileMapper().analyze(pf_parsed, converter_collections=all_collections)
+        extra = pf_report.required_collections - all_collections
+        all_collections.update(pf_report.required_collections)
+        console.print(f"  [green]✓[/green] {len(pf_parsed.modules)} modules analyzed "
+                      f"({len(pf_parsed.forge_modules)} Forge, {len(pf_parsed.git_modules)} git)")
+        if extra:
+            console.print(f"  [green]+[/green] Additional collections from Puppetfile: {', '.join(sorted(extra))}")
+        if pf_report.manual_modules:
+            console.print(f"  [yellow]⚠[/yellow] {len(pf_report.manual_modules)} module(s) need manual conversion "
+                          f"({', '.join(m.module.full_name for m in pf_report.manual_modules)})")
+        if pf_report.unknown_modules:
+            console.print(f"  [yellow]?[/yellow] {len(pf_report.unknown_modules)} unknown module(s) — "
+                          "run 'p2a analyze-puppetfile' for details")
+
+    # ── 5. Global requirements.yml ───────────────────────────────────────────
     if all_collections and not dry_run:
         total.collections = all_collections
         req_file = out / "requirements.yml"
@@ -429,6 +452,149 @@ def convert_all_cmd(
     console.print()
     _print_report(total)
     _write_report_if_requested(rb, report)
+
+
+# ── analyze-puppetfile ────────────────────────────────────────────────────────
+
+@main.command("analyze-puppetfile")
+@click.argument("puppetfile", type=click.Path(exists=True, dir_okay=False))
+@_verbose_option
+@_report_option
+def analyze_puppetfile_cmd(
+    puppetfile: str,
+    verbose: int,
+    report: str | None,
+) -> None:
+    """Analyze a Puppetfile and map Forge modules to Ansible Galaxy collections.
+
+    For each module the tool reports:
+
+    \b
+      mapped    — known Galaxy collection equivalent
+      builtin   — covered by ansible.builtin, no extra collection needed
+      converted — p2a converts its resources automatically
+      git       — internal/git module → convert as local Ansible role
+      manual    — requires manual rewrite (no Ansible equivalent)
+      unknown   — not in the mapping database
+    """
+    _setup_logging(verbose)
+    from src.puppetfile.parser import PuppetfileParser
+    from src.puppetfile.mapper import PuppetfileMapper, STATUS_MAPPED, STATUS_BUILTIN, STATUS_CONVERTED, STATUS_GIT, STATUS_LOCAL, STATUS_MANUAL, STATUS_UNKNOWN
+
+    pf = PuppetfileParser().parse_file(puppetfile)
+    r  = PuppetfileMapper().analyze(pf)
+
+    console.print(f"\n[bold]Puppetfile analysis:[/bold] {puppetfile}")
+    console.print(f"  Forge URL: [dim]{pf.forge_url}[/dim]")
+    console.print(f"  Total modules: {len(pf.modules)} "
+                  f"([cyan]{len(pf.forge_modules)}[/cyan] Forge, "
+                  f"[cyan]{len(pf.git_modules)}[/cyan] git, "
+                  f"[cyan]{len(pf.local_modules)}[/cyan] local)\n")
+
+    _STATUS_STYLE = {
+        STATUS_MAPPED:    ("[green]mapped   [/green]", "Galaxy collection available"),
+        STATUS_BUILTIN:   ("[green]builtin  [/green]", "ansible.builtin covers this"),
+        STATUS_CONVERTED: ("[green]converted[/green]", "p2a converts resources automatically"),
+        STATUS_GIT:       ("[cyan]git      [/cyan]",   "convert as local Ansible role"),
+        STATUS_LOCAL:     ("[cyan]local    [/cyan]",   "convert as local Ansible role"),
+        STATUS_MANUAL:    ("[yellow]manual   [/yellow]","requires manual rewrite"),
+        STATUS_UNKNOWN:   ("[red]unknown  [/red]",     "no mapping known"),
+    }
+
+    table = Table(title="Module Mapping", box=box.SIMPLE)
+    table.add_column("Module",      style="cyan",  no_wrap=True)
+    table.add_column("Version",     style="dim",   no_wrap=True)
+    table.add_column("Status",      no_wrap=True)
+    table.add_column("Collection",  style="green", no_wrap=True)
+    table.add_column("Notes",       style="dim")
+
+    for mapping in r.mappings:
+        mod = mapping.module
+        style, _ = _STATUS_STYLE.get(mapping.status, ("[white]?[/white]", ""))
+        table.add_row(
+            mod.full_name,
+            mod.version or (f"git:{mod.git_ref}" if mod.git_ref else "—"),
+            style,
+            mapping.galaxy_collection or "—",
+            mapping.notes,
+        )
+
+    console.print(table)
+
+    if r.required_collections:
+        console.print(f"\n[bold]Galaxy collections required:[/bold]")
+        for col in sorted(r.required_collections):
+            console.print(f"  [green]•[/green] {col}")
+        console.print(
+            "\n  Install with: [dim]ansible-galaxy collection install -r requirements.yml[/dim]"
+        )
+
+    if r.manual_modules:
+        console.print(f"\n[yellow]⚠  {len(r.manual_modules)} module(s) require manual conversion:[/yellow]")
+        for m in r.manual_modules:
+            console.print(f"  [yellow]•[/yellow] {m.module.full_name} — {m.notes}")
+
+    if r.unknown_modules:
+        console.print(f"\n[red]?  {len(r.unknown_modules)} unknown module(s):[/red]")
+        for m in r.unknown_modules:
+            console.print(f"  [red]•[/red] {m.module.full_name} — {m.notes}")
+
+    console.print(
+        f"\n[bold]Summary:[/bold] "
+        f"{r.covered_total}/{r.forge_total} Forge modules covered, "
+        f"{len(r.git_modules)} git module(s) → local roles"
+    )
+
+    if report:
+        _write_puppetfile_report(r, Path(report))
+        console.print(f"\n[bold green]Report written:[/bold green] {report}")
+
+
+def _write_puppetfile_report(report, path: Path) -> None:
+    """Write Puppetfile analysis report as Markdown."""
+    from src.puppetfile.mapper import STATUS_MAPPED, STATUS_BUILTIN, STATUS_CONVERTED, STATUS_GIT, STATUS_LOCAL, STATUS_MANUAL, STATUS_UNKNOWN
+    lines = [
+        "# Puppetfile Analysis Report",
+        "",
+        f"Total modules: {len(report.mappings)}",
+        f"Forge modules covered: {report.covered_total}/{report.forge_total}",
+        f"Git/local modules (→ local roles): {len(report.git_modules) + len(report.local_modules)}",
+        "",
+        "## Module Mapping",
+        "",
+        "| Module | Version | Status | Collection | Notes |",
+        "|--------|---------|--------|------------|-------|",
+    ]
+    for m in report.mappings:
+        mod = m.module
+        ver = mod.version or (f"git:{mod.git_ref}" if mod.git_ref else "—")
+        lines.append(
+            f"| {mod.full_name} | {ver} | {m.status} | {m.galaxy_collection or '—'} | {m.notes} |"
+        )
+
+    if report.required_collections:
+        lines += ["", "## Required Galaxy Collections", ""]
+        for col in sorted(report.required_collections):
+            lines.append(f"- `{col}`")
+        lines += [
+            "",
+            "```bash",
+            "ansible-galaxy collection install -r requirements.yml",
+            "```",
+        ]
+
+    if report.manual_modules:
+        lines += ["", "## Modules Requiring Manual Conversion", ""]
+        for m in report.manual_modules:
+            lines.append(f"- **{m.module.full_name}**: {m.notes}")
+
+    if report.unknown_modules:
+        lines += ["", "## Unknown Modules", ""]
+        for m in report.unknown_modules:
+            lines.append(f"- **{m.module.full_name}**: {m.notes}")
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 # ── convert-erb ────────────────────────────────────────────────────────────────
@@ -732,6 +898,17 @@ def _autodiscover_hieradata(base: Path, hiera_file: Path | None, verbose: int) -
             if verbose >= 2:
                 console.print(f"  [dim]Auto-detected hieradata: {d}[/dim]")
             return d
+    return None
+
+
+def _autodiscover_puppetfile(base: Path, verbose: int) -> Path | None:
+    """Find a Puppetfile in the codebase root."""
+    for name in ("Puppetfile",):
+        f = base / name
+        if f.exists():
+            if verbose >= 2:
+                console.print(f"  [dim]Auto-detected Puppetfile: {f}[/dim]")
+            return f
     return None
 
 

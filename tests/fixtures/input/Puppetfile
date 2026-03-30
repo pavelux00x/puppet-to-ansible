@@ -1,0 +1,38 @@
+forge 'https://forgeapi.puppet.com'
+
+# Core Puppet modules
+mod 'puppetlabs/stdlib', '9.4.1'
+mod 'puppetlabs/concat', '9.0.2'
+mod 'puppetlabs/apache', '11.1.0'
+
+# Database
+mod 'puppetlabs/mysql', '15.0.0'
+mod 'puppetlabs/postgresql', '10.1.0'
+
+# OS management
+mod 'puppetlabs/apt', '9.4.0'
+mod 'puppetlabs/firewall', '7.0.0'
+mod 'puppetlabs/selinux', '4.0.0'
+mod 'puppetlabs/inifile', '6.1.0'
+
+# Containers
+mod 'puppetlabs/kubernetes', '8.0.0'
+mod 'garethr/docker', '5.3.0'
+
+# PKI
+mod 'camptocamp/openssl', '2.1.0'
+
+# Internal modules from Git
+mod 'profile',
+  git: 'https://git.example.com/puppet/profile.git',
+  tag: 'v3.2.1'
+
+mod 'role',
+  :git => 'https://git.example.com/puppet/role.git',
+  :branch => 'main'
+
+# Module with no version
+mod 'puppetlabs/ntp'
+
+# Unknown module
+mod 'acme/custom_thing', '1.0.0'

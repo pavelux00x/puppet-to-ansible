@@ -48,8 +48,11 @@ p2a targets:
   task and are logged in the report; the output is always valid YAML
 - **FQCN output** — every generated module reference uses the fully qualified form
   (`ansible.builtin.package`, not `package`)
+- **Puppetfile analysis** — `analyze-puppetfile` maps every Forge module to its Ansible Galaxy
+  equivalent, marks git/internal modules as local roles, and flags anything that needs manual work;
+  `convert-all` auto-detects and integrates a Puppetfile automatically
 - **Auto-generated `requirements.yml`** — lists every Galaxy collection needed by the converted
-  output
+  output, merged from both the resource conversion and the Puppetfile analysis
 - **Detailed conversion report** — printed after every run; shows converted counts, warnings,
   and unconverted items by type
 
@@ -209,13 +212,15 @@ p2a convert-all <puppet_dir> [OPTIONS]
 | Hiera config | `hiera.yaml`, `hiera.yml` |
 | Hiera data directory | `datadir` from `hiera.yaml`, then `hieradata/`, `hiera/`, `data/` |
 | Site manifest | `manifests/site.pp`, `site.pp`, `manifests/init.pp` |
+| Puppetfile | `Puppetfile` (root of `puppet_dir`) |
 
 **Conversion passes (in order):**
 
 1. Each discovered module → `roles/<module_name>/`
 2. `site.pp` (with resolved includes) → `site.yml` + `inventory/hosts.yml`
 3. Hiera data directory → `inventory/group_vars/` and `inventory/host_vars/`
-4. Aggregated `requirements.yml`
+4. Puppetfile (if present) → additional Galaxy collections merged into `requirements.yml`
+5. Aggregated `requirements.yml`
 
 **Examples:**
 
@@ -269,6 +274,69 @@ p2a convert-hiera /etc/puppet/hieradata/ -o inventory/
 ```
 
 See [Hiera Integration](#hiera-integration) for details on the hierarchy mapping.
+
+---
+
+### `p2a analyze-puppetfile` — Puppetfile analysis
+
+Maps every module in a Puppetfile to its Ansible equivalent and reports which Galaxy collections
+are required. Run this before a migration to understand coverage and identify anything that needs
+manual work.
+
+```bash
+p2a analyze-puppetfile <Puppetfile> [--report <path>] [-v]
+```
+
+Each module receives a status:
+
+| Status | Meaning |
+|---|---|
+| `converted` | p2a converts its resources automatically — no extra collection needed |
+| `mapped` | known Galaxy collection equivalent (e.g. `community.mysql`) |
+| `builtin` | covered by `ansible.builtin`, no collection install required |
+| `git` | internal / git-sourced module → convert as a local Ansible role |
+| `manual` | requires manual rewrite (e.g. Windows DSC modules) |
+| `unknown` | not in the mapping database — check Ansible Galaxy manually |
+
+```bash
+# Interactive table output
+p2a analyze-puppetfile Puppetfile
+
+# Save a Markdown report
+p2a analyze-puppetfile Puppetfile --report puppetfile-report.md
+```
+
+**Example output:**
+
+```
+Puppetfile analysis: Puppetfile
+  Forge URL: https://forgeapi.puppet.com
+  Total modules: 16 (14 Forge, 2 git, 0 local)
+
+  Module Mapping
+  ──────────────────────────────────────────────────────────────────────────
+  Module                    Version    Status      Collection           Notes
+  puppetlabs/stdlib         9.4.1      builtin     —                    Functions → Jinja2 filters
+  puppetlabs/mysql          15.0.0     mapped      community.mysql      mysql_db/user → community.mysql
+  puppetlabs/apache         11.1.0     converted   —                    Resources convert to ansible.builtin.*
+  puppetlabs/kubernetes     8.0.0      mapped      kubernetes.core      → kubernetes.core.k8s
+  garethr/docker            5.3.0      mapped      community.docker     → community.docker.docker_container
+  profile                   git:v3.2.1 git         —                    convert as local Ansible role
+  acme/custom_thing         1.0.0      unknown     —                    No known mapping — check Galaxy
+  ...
+
+Galaxy collections required:
+  • community.crypto
+  • community.docker
+  • community.mysql
+  • community.postgresql
+  • kubernetes.core
+
+Summary: 13/14 Forge modules covered, 2 git module(s) → local roles
+```
+
+`convert-all` runs Puppetfile analysis automatically when a `Puppetfile` is found at the codebase
+root; its collection results are merged into the global `requirements.yml`.
 
 ---
 
@@ -406,6 +474,7 @@ nginx_user: www-data
 
 ```
 /etc/puppet/
+├── Puppetfile
 ├── hiera.yaml
 ├── manifests/
 │   └── site.pp

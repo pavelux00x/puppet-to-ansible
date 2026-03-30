@@ -149,6 +149,12 @@ class ManifestConverter:
             if not (isinstance(v, str) and v.startswith("{{"))
             and not k.startswith("__")
         }
+        # Merge hiera() defaults — these are the fallback values declared inline in
+        # hiera('key', default) calls. Only add them when no concrete value was already
+        # resolved (so a real Hiera lookup always wins over the inline default).
+        for k, v in context.hiera_defaults.items():
+            if k not in result.variables:
+                result.variables[k] = v
         return result
 
     # ── Statement dispatcher ──────────────────────────────────────────────────
@@ -491,8 +497,9 @@ class ManifestConverter:
     ) -> None:
         """Convert a `class foo ( params ) { body }` definition."""
         class_context = ConversionContext(puppet_version=context.puppet_version)
-        # Inherit parent scope
+        # Inherit parent scope and Hiera resolver
         class_context.variables = dict(context.variables)
+        class_context.hiera_scope = context.hiera_scope
 
         # Set class parameters as variables using their defaults
         class_vars: dict[str, Any] = {}
@@ -528,6 +535,9 @@ class ManifestConverter:
             context.warn(f"[{cls.name}] {w}")
         for u in class_context.unconverted:
             context.add_unconverted(u["type"], u["title"], u["reason"])
+        # Propagate hiera() inline defaults upward so they land in defaults/main.yml
+        for k, v in class_context.hiera_defaults.items():
+            context.hiera_defaults.setdefault(k, v)
 
         result.classes.append({
             "name":   cls.name,

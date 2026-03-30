@@ -8,3 +8,5 @@ build/
 .ruff_cache/
 output/
 *.yml.bak
+.claude/
+CLAUDE.md
