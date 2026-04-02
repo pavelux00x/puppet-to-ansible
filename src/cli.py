@@ -734,8 +734,10 @@ def _convert_one_module(
         if files_dir.exists():
             _copy_files(files_dir, role_dir / "files")
 
+        unique_w = len(dict.fromkeys(merged.warnings))
+        unique_u = len({f"{u['type']}|{u['title']}" for u in merged.unconverted})
         console.print(f"    [green]✓[/green] roles/{mod_dir.name}/  "
-                      f"(conv={merged.total_converted} warns={len(merged.warnings)} unconv={len(merged.unconverted)})")
+                      f"(conv={merged.total_converted} warns={unique_w} unconv={unique_u})")
 
     return merged
 
@@ -1001,19 +1003,27 @@ def _print_report(result: ConversionResult) -> None:
         table.add_row("[bold]TOTAL[/bold]", f"[bold]{total}[/bold]")
         console.print(table)
 
-    if result.warnings:
-        console.print(f"\n[yellow]⚠  {len(result.warnings)} warning(s):[/yellow]")
-        for w in result.warnings[:10]:
+    unique_warnings = list(dict.fromkeys(result.warnings))  # dedup, preserve order
+    if unique_warnings:
+        console.print(f"\n[yellow]⚠  {len(unique_warnings)} warning(s):[/yellow]")
+        for w in unique_warnings[:10]:
             console.print(f"  [yellow]•[/yellow] {w}")
-        if len(result.warnings) > 10:
-            console.print(f"  [dim]... and {len(result.warnings) - 10} more[/dim]")
+        if len(unique_warnings) > 10:
+            console.print(f"  [dim]... and {len(unique_warnings) - 10} more[/dim]")
 
-    if result.unconverted:
-        console.print(f"\n[red]✗  {len(result.unconverted)} resource(s) not converted:[/red]")
-        for item in result.unconverted[:10]:
+    unique_unconverted = []
+    seen_unc: set[str] = set()
+    for item in result.unconverted:
+        key = f"{item['type']}|{item['title']}"
+        if key not in seen_unc:
+            seen_unc.add(key)
+            unique_unconverted.append(item)
+    if unique_unconverted:
+        console.print(f"\n[red]✗  {len(unique_unconverted)} resource(s) not converted:[/red]")
+        for item in unique_unconverted[:10]:
             console.print(f"  [red]•[/red] {item['type']}['{item['title']}'] — {item['reason']}")
-        if len(result.unconverted) > 10:
-            console.print(f"  [dim]... and {len(result.unconverted) - 10} more[/dim]")
+        if len(unique_unconverted) > 10:
+            console.print(f"  [dim]... and {len(unique_unconverted) - 10} more[/dim]")
 
     if result.collections:
         console.print(f"\n[bold]Collections required:[/bold] {', '.join(sorted(result.collections))}")

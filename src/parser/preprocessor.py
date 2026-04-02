@@ -54,9 +54,9 @@ class ManifestPreprocessor:
     # Regex patterns for cheap pre-scan (no full parse needed at this stage)
     _INCLUDE_RE = re.compile(
         r"""(?x)
-        \b include \s+ (['"]?)
+        \b (include|contain) \s+ (['"]?)
         ([\w:]+)          # class name
-        \1
+        \2
         """,
         re.MULTILINE,
     )
@@ -198,11 +198,15 @@ class ManifestPreprocessor:
         # Collect include targets from both include statements and require =>
         targets: set[str] = set()
         for m in self._INCLUDE_RE.finditer(source):
-            targets.add(m.group(2))
+            targets.add(m.group(3))
         for m in self._REQUIRE_RE.finditer(source):
             targets.add(m.group(2))
 
         for class_name in sorted(targets):
+            # Skip capitalized names — these are native Puppet resource type
+            # references (Package, File, User, Exec, …), not class names.
+            if class_name[0].isupper():
+                continue
             # Already indexed → no need to load again
             if class_name in self._result.class_sources:
                 continue

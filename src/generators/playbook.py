@@ -80,24 +80,37 @@ class RoleGenerator:
         if not role_name:
             role_name = source_name
 
-        # tasks/main.yml — main task list
+        # tasks/main.yml — top-level tasks + include_tasks for each class/defined type
         tasks_dir = base / "tasks"
         tasks_dir.mkdir(exist_ok=True)
-        _write_yaml_file(
-            tasks_dir / "main.yml",
-            [_clean_task(t) for t in result.tasks],
-            result.source_file,
-        )
 
-        # Write per-class task files and include them from main.yml
+        main_tasks: list[dict] = [_clean_task(t) for t in result.tasks]
+
+        # Write per-class task files and wire them into main.yml via include_tasks
         for cls in result.classes:
-            cls_file = tasks_dir / f"{cls['name'].replace('::', '_')}.yml"
+            if not cls["tasks"]:
+                continue
+            safe_name = cls["name"].replace("::", "_")
+            cls_file = tasks_dir / f"{safe_name}.yml"
             _write_yaml_file(cls_file, [_clean_task(t) for t in cls["tasks"]], result.source_file)
+            main_tasks.append({
+                "name": f"Include tasks for {cls['name']}",
+                "ansible.builtin.include_tasks": f"{safe_name}.yml",
+            })
 
-        # Write per-defined-type task files
+        # Write per-defined-type task files and wire them into main.yml
         for dt in result.defined_types:
-            dt_file = tasks_dir / f"{dt['name'].replace('::', '_')}.yml"
+            if not dt["tasks"]:
+                continue
+            safe_name = dt["name"].replace("::", "_")
+            dt_file = tasks_dir / f"{safe_name}.yml"
             _write_yaml_file(dt_file, [_clean_task(t) for t in dt["tasks"]], result.source_file)
+            main_tasks.append({
+                "name": f"Include tasks for defined type {dt['name']}",
+                "ansible.builtin.include_tasks": f"{safe_name}.yml",
+            })
+
+        _write_yaml_file(tasks_dir / "main.yml", main_tasks, result.source_file)
 
         # handlers/main.yml
         if result.handlers:
@@ -144,9 +157,19 @@ class RoleGenerator:
         """Write requirements.yml if collections are needed."""
         if not result.collections:
             return None
+        # Minimum tested versions per collection
+        _MIN_VERSIONS: dict[str, str] = {
+            "ansible.posix":        ">=1.5.0",
+            "community.general":    ">=9.0.0",
+            "community.docker":     ">=3.0.0",
+            "community.mysql":      ">=3.0.0",
+            "community.postgresql": ">=3.0.0",
+            "community.crypto":     ">=2.0.0",
+            "kubernetes.core":      ">=3.0.0",
+        }
         req: dict[str, Any] = {
             "collections": [
-                {"name": col, "version": ">=1.0.0"}
+                {"name": col, "version": _MIN_VERSIONS.get(col, ">=1.0.0")}
                 for col in sorted(result.collections)
             ]
         }

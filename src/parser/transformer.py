@@ -135,6 +135,10 @@ class PuppetTransformer(Transformer):
         value = items[1]
         return ResourceAttribute(name=name, value=value, line=_tok_line(items[0]))
 
+    def resource_attr_unless(self, items: list[Any]) -> ResourceAttribute:
+        # `unless => expr` — the keyword "unless" is a valid exec attribute
+        return ResourceAttribute(name="unless", value=items[0], line=0)
+
     def resource_default(self, items: list[Any]) -> ResourceDeclaration:
         rtype = items[0]
         attrs = items[1] if len(items) > 1 and isinstance(items[1], list) else []
@@ -248,6 +252,11 @@ class PuppetTransformer(Transformer):
         return items[0]
 
     def include_statement(self, items: list[Any]) -> list[ClassDeclaration]:
+        refs = items[0] if items else []
+        return [ClassDeclaration(name=r, is_include=True) for r in refs]
+
+    def contain_statement(self, items: list[Any]) -> list[ClassDeclaration]:
+        # `contain` behaves like `include` for conversion purposes
         refs = items[0] if items else []
         return [ClassDeclaration(name=r, is_include=True) for r in refs]
 

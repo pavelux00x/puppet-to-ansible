@@ -13,6 +13,7 @@ statement: resource_declaration
          | class_definition
          | class_declaration
          | include_statement
+         | contain_statement
          | defined_type_definition
          | node_definition
          | variable_assignment
@@ -43,6 +44,7 @@ resource_title: expression
 resource_attributes: resource_attribute ("," resource_attribute)* ","?
 
 resource_attribute: LNAME "=>" expression
+                  | "unless" "=>" expression  -> resource_attr_unless
                   | "*" "=>" expression
 
 // Resource defaults (capitalized type, no title)
@@ -93,6 +95,7 @@ class_declaration: "class" "{" string_expr ":" resource_attributes? "}"
 string_expr: expression
 
 include_statement: "include" include_list
+contain_statement: "contain" include_list
 include_list: include_item ("," include_item)*
 include_item: LNAME ("::" LNAME)*
 
