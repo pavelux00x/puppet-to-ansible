@@ -2,10 +2,11 @@
 
 Convert Puppet manifests, modules, and entire codebases into production-ready Ansible.
 
+* 100% Local Execution ( No external APIS / LLM ) 
+
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue?logo=python&logoColor=white)
 ![License](https://img.shields.io/badge/license-MIT-lightgrey)
 
-* 100% Local Execution
 ---
 
 ## Install
