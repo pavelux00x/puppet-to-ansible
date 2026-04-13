@@ -1,8 +1,8 @@
 """Tests for Puppetfile → Ansible mapper."""
 from pathlib import Path
 import pytest
-from src.puppetfile.parser import PuppetfileParser
-from src.puppetfile.mapper import (
+from puppet_to_ansible.puppetfile.parser import PuppetfileParser
+from puppet_to_ansible.puppetfile.mapper import (
     PuppetfileMapper,
     STATUS_MAPPED, STATUS_BUILTIN, STATUS_CONVERTED,
     STATUS_MANUAL, STATUS_GIT, STATUS_UNKNOWN,

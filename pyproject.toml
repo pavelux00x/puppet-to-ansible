@@ -22,11 +22,10 @@ lint = [
 ]
 
 [tool.setuptools.packages.find]
-where = ["."]
-include = ["src*"]
+where = ["src"]
 
 [project.scripts]
-p2a = "src.cli:main"
+p2a = "puppet_to_ansible.cli:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

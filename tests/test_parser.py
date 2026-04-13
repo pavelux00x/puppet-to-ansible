@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from src.parser.ast_nodes import (
+from puppet_to_ansible.parser.ast_nodes import (
     ClassDeclaration,
     ClassDefinition,
     DefinedTypeDefinition,
@@ -14,7 +14,7 @@ from src.parser.ast_nodes import (
     UnlessStatement,
     VariableAssignment,
 )
-from src.parser.parser import ParseError, parse
+from puppet_to_ansible.parser.parser import ParseError, parse
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -55,12 +55,12 @@ class TestResourceDeclaration:
     def test_virtual_resource(self):
         r = first("@package { 'nginx': ensure => installed }")
         assert isinstance(r, ResourceDeclaration)
-        from src.parser.ast_nodes import ResourceVirtuality
+        from puppet_to_ansible.parser.ast_nodes import ResourceVirtuality
         assert r.virtuality == ResourceVirtuality.VIRTUAL
 
     def test_exported_resource(self):
         r = first("@@file { '/etc/ssh/known_hosts': content => 'x' }")
-        from src.parser.ast_nodes import ResourceVirtuality
+        from puppet_to_ansible.parser.ast_nodes import ResourceVirtuality
         assert r.virtuality == ResourceVirtuality.EXPORTED
 
     def test_multi_title_array(self):
@@ -87,7 +87,7 @@ class TestVariableAssignment:
 
     def test_fact_access(self):
         v = first("$os = $facts['os']['family']")
-        from src.parser.ast_nodes import FactAccess
+        from puppet_to_ansible.parser.ast_nodes import FactAccess
         assert isinstance(v, VariableAssignment)
 
     def test_hiera_lookup(self):
@@ -132,7 +132,7 @@ class TestConditionals:
           default:  { }
         }
         """
-        from src.parser.ast_nodes import CaseStatement
+        from puppet_to_ansible.parser.ast_nodes import CaseStatement
         s = first(src)
         assert isinstance(s, CaseStatement)
 
@@ -237,7 +237,7 @@ class TestPuppet4Features:
         }
         """
         s = first(src)
-        from src.parser.ast_nodes import MethodCall
+        from puppet_to_ansible.parser.ast_nodes import MethodCall
         assert isinstance(s, MethodCall)
 
     def test_lookup_with_types(self):
