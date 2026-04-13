@@ -1,6 +1,7 @@
 """Playbook generator — converts a ConversionResult into a single Ansible playbook YAML."""
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,26 @@ def _clean_task(task: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in task.items() if not k.startswith("__")}
 
 
+def _deduplicate_names(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """L1: Ensure all task `name` fields are unique within the list.
+
+    ansible-lint W306 flags duplicate names in the same play/task file.
+    Duplicates get a numeric suffix: 'Install nginx', 'Install nginx (2)', …
+    """
+    seen: dict[str, int] = {}
+    result = []
+    for task in tasks:
+        name = task.get("name", "")
+        if name in seen:
+            seen[name] += 1
+            task = dict(task)
+            task["name"] = f"{name} ({seen[name]})"
+        else:
+            seen[name] = 1
+        result.append(task)
+    return result
+
+
 class PlaybookGenerator:
     """Generates an Ansible playbook from a ConversionResult."""
 
@@ -25,8 +46,8 @@ class PlaybookGenerator:
         become: bool = True,
     ) -> str:
         """Return the playbook as a YAML string."""
-        tasks = [_clean_task(t) for t in result.tasks]
-        handlers = [_clean_task(h) for h in result.handlers]
+        tasks    = _deduplicate_names([_clean_task(t) for t in result.tasks])
+        handlers = _deduplicate_names([_clean_task(h) for h in result.handlers])
 
         play: dict[str, Any] = {
             "name": f"Converted from {Path(result.source_file).name or 'Puppet manifest'}",
@@ -84,7 +105,7 @@ class RoleGenerator:
         tasks_dir = base / "tasks"
         tasks_dir.mkdir(exist_ok=True)
 
-        main_tasks: list[dict] = [_clean_task(t) for t in result.tasks]
+        main_tasks: list[dict] = _deduplicate_names([_clean_task(t) for t in result.tasks])
 
         # Write per-class task files and wire them into main.yml via include_tasks
         for cls in result.classes:
@@ -92,7 +113,7 @@ class RoleGenerator:
                 continue
             safe_name = cls["name"].replace("::", "_")
             cls_file = tasks_dir / f"{safe_name}.yml"
-            _write_yaml_file(cls_file, [_clean_task(t) for t in cls["tasks"]], result.source_file)
+            _write_yaml_file(cls_file, _deduplicate_names([_clean_task(t) for t in cls["tasks"]]), result.source_file)
             main_tasks.append({
                 "name": f"Include tasks for {cls['name']}",
                 "ansible.builtin.include_tasks": f"{safe_name}.yml",
@@ -104,7 +125,7 @@ class RoleGenerator:
                 continue
             safe_name = dt["name"].replace("::", "_")
             dt_file = tasks_dir / f"{safe_name}.yml"
-            _write_yaml_file(dt_file, [_clean_task(t) for t in dt["tasks"]], result.source_file)
+            _write_yaml_file(dt_file, _deduplicate_names([_clean_task(t) for t in dt["tasks"]]), result.source_file)
             main_tasks.append({
                 "name": f"Include tasks for defined type {dt['name']}",
                 "ansible.builtin.include_tasks": f"{safe_name}.yml",
@@ -203,10 +224,16 @@ class InventoryGenerator:
                     group = _infer_group(node_def["tasks"])
                     groups.setdefault(group, []).append(hostname)
                 elif matcher["type"] == "regex":
+                    pattern = matcher["pattern"]
                     warnings.append(
-                        f"Regex node definition '/{matcher['pattern']}/' — "
+                        f"Regex node definition '/{pattern}/' — "
                         f"add matching hosts manually to the inventory."
                     )
+                    # L4: add a placeholder group so the operator has a clear anchor
+                    safe_group = re.sub(r"[^a-zA-Z0-9_]", "_", pattern).strip("_")[:40] or "regex_nodes"
+                    placeholder_group = f"regex_{safe_group}"
+                    if placeholder_group not in groups:
+                        groups[placeholder_group] = []  # empty — operator must fill it in
 
         inventory: dict[str, Any] = {"all": {"children": {}}}
         for group, hosts in groups.items():

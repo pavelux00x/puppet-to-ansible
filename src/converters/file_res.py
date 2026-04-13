@@ -64,14 +64,17 @@ class FileConverter(BaseConverter):
         group   = str(self.resolve(group_node, context)) if group_node else None
         mode    = str(self.resolve(mode_node, context)) if mode_node else None
 
-        # Common file attributes
-        file_attrs: dict[str, Any] = {"path": title}
+        # ansible.builtin.file uses 'path:', copy/template use 'dest:'
+        meta: dict[str, Any] = {}
         if owner:
-            file_attrs["owner"] = owner
+            meta["owner"] = owner
         if group:
-            file_attrs["group"] = group
+            meta["group"] = group
         if mode:
-            file_attrs["mode"] = mode
+            meta["mode"] = mode
+
+        file_attrs: dict[str, Any] = {"path": title, **meta}   # for ansible.builtin.file
+        xfer_attrs: dict[str, Any] = {"dest": title, **meta}   # for copy / template
 
         # Determine which module to use based on ensure + content/source
         if ensure in ("absent",):
@@ -116,7 +119,7 @@ class FileConverter(BaseConverter):
             # Template reference from template() function call
             if content_str.startswith("__template__"):
                 template_name = content_str.replace("__template__", "")
-                template_params = {**file_attrs, "src": template_name}
+                template_params = {**xfer_attrs, "src": template_name}
                 return [self.make_task(
                     name=f"Template {title}",
                     module="ansible.builtin.template",
@@ -129,12 +132,12 @@ class FileConverter(BaseConverter):
                 return [self.make_task(
                     name=f"[TODO] Template {title} (inline_template)",
                     module="ansible.builtin.template",
-                    params={**file_attrs, "src": f"{os.path.basename(title)}.j2"},
+                    params={**xfer_attrs, "src": f"{os.path.basename(title)}.j2"},
                     notify=notify or None,
                     when=when,
                 )]
             # Literal content → copy with content:
-            copy_params = {**file_attrs, "content": content_str}
+            copy_params = {**xfer_attrs, "content": content_str}
             return [self.make_task(
                 name=f"Write {title}",
                 module="ansible.builtin.copy",
@@ -147,7 +150,7 @@ class FileConverter(BaseConverter):
             source_str = str(source)
             # puppet:///modules/mod/file → files/file
             src = _puppet_source_to_ansible(source_str)
-            copy_params = {**file_attrs, "src": src}
+            copy_params = {**xfer_attrs, "src": src}
             return [self.make_task(
                 name=f"Copy {title}",
                 module="ansible.builtin.copy",

@@ -58,6 +58,36 @@ from src.utils.hiera_resolver import HieraResolver, HieraAwareScope, build_hiera
 logger = logging.getLogger(__name__)
 
 
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+# Puppet ordering/notification metaparameters that have no meaning in Ansible vars
+_PUPPET_METAPARAMS: frozenset[str] = frozenset({
+    "require", "before", "notify", "subscribe",
+    "tag", "alias", "loglevel", "audit", "noop",
+    "schedule", "stage",
+})
+
+
+def _is_array_type_node(node: PuppetNode) -> bool:
+    """Return True if the AST node is known to produce an Array value.
+
+    Used to decide whether to emit `loop: {{ var }}` (array) or
+    `loop: {{ var | dict2items }}` (hash) for dynamic .each loops.
+    """
+    if isinstance(node, FunctionCall):
+        if node.name == "hiera_array":
+            return True
+        if node.name in ("lookup", "hiera") and len(node.arguments) >= 2:
+            # Second arg is the type hint: Array[String], Array, etc.
+            type_arg = node.arguments[1]
+            type_str = str(getattr(type_arg, "value", type_arg))
+            if "Array" in type_str:
+                return True
+    if isinstance(node, ArrayLiteral):
+        return True
+    return False
+
+
 # ── Conversion Result ──────────────────────────────────────────────────────────
 
 @dataclass
@@ -109,11 +139,22 @@ class ManifestConverter:
         puppet_version: int = 4,
         hiera_resolver: HieraResolver | None = None,
         module_paths: list[str] | None = None,
+        known_defined_types: set[str] | None = None,
+        shared_virtual_resources: dict | None = None,
     ) -> None:
         self.registry = get_registry()
         self.puppet_version = puppet_version
         self._hiera = hiera_resolver
         self._module_paths = module_paths or []
+        # Defined type names known across all files in this module.
+        # Used to generate include_tasks instead of TODO when a defined type is called.
+        self.known_defined_types: set[str] = set(known_defined_types or [])
+        # L5: shared dict for @virtual resources across file boundaries.
+        # Inject a single dict from the CLI when converting multiple files so that
+        # realize() in file B can find @virtual resources declared in file A.
+        self._shared_virtual_resources: dict = (
+            shared_virtual_resources if shared_virtual_resources is not None else {}
+        )
 
     def convert(self, manifest: Manifest) -> ConversionResult:
         """Main entry point — convert a full manifest."""
@@ -283,6 +324,8 @@ class ManifestConverter:
                     title = self._resolve_title_str(body, context)
                     key = f"__virtual__{decl.type_name.lower()}__{title}"
                     context.set_variable(key, body)
+                    # L5: also store in shared dict so realize() in other files can find it
+                    self._shared_virtual_resources[key] = body
                 except Exception as exc:
                     context.warn(f"Virtual resource @{decl.type_name}: {exc}")
             context.warn(
@@ -324,6 +367,14 @@ class ManifestConverter:
         for body in decl.bodies:
             try:
                 self._apply_resource_defaults(body, resource_type, context)
+
+                # Defined type instantiation — emit include_tasks with vars
+                if resource_type in self.known_defined_types and not self.registry.has(resource_type):
+                    dt_tasks = self._convert_defined_type_call(resource_type, body, context)
+                    tasks.extend(dt_tasks)
+                    result.record_converted(resource_type)
+                    continue
+
                 new_tasks = self.registry.convert_resource(resource_type, body, context)
                 tasks.extend(new_tasks)
                 if new_tasks and not any("__puppet_original__" in t for t in new_tasks):
@@ -514,13 +565,21 @@ class ManifestConverter:
             except Exception as exc:
                 context.warn(f"Class {cls.name} param ${param.name}: {exc}")
 
-        # If class inherits, note parent
+        # M4: If class inherits, merge parent vars into child vars (child wins on conflict)
         if cls.parent:
-            class_context.warn(
-                f"Class {cls.name} inherits {cls.parent} — "
-                f"inheritance is not supported in Ansible; "
-                f"include parent role manually or merge vars."
-            )
+            parent_cls = next((c for c in result.classes if c["name"] == cls.parent), None)
+            if parent_cls:
+                merged_parent = dict(parent_cls.get("vars", {}))
+                merged_parent.update(class_vars)  # child overrides parent
+                class_vars = merged_parent
+                for k, v in parent_cls.get("vars", {}).items():
+                    class_context.variables.setdefault(k, v)
+            else:
+                class_context.warn(
+                    f"Class {cls.name} inherits {cls.parent} — "
+                    f"parent class not found in conversion scope; "
+                    f"include parent role manually and verify vars."
+                )
 
         class_tasks: list[dict[str, Any]] = []
         self._walk_statements(cls.body, class_context, result, class_tasks)
@@ -616,6 +675,57 @@ class ManifestConverter:
             "tasks": dt_tasks,
             "vars":  dt_vars,
         })
+        # Register so sibling manifests in the same module can emit include_tasks
+        self.known_defined_types.add(dt.name.lower())
+
+    def _convert_defined_type_call(
+        self,
+        resource_type: str,
+        body: ResourceBody,
+        context: ConversionContext,
+    ) -> list[dict[str, Any]]:
+        """Convert a defined-type instantiation to include_tasks with vars.
+
+        Example Puppet:
+            webstack::vhost { 'myapp':
+              docroot => '/var/www/myapp',
+              port    => 8080,
+            }
+
+        Generates:
+            - name: Include defined type webstack::vhost for myapp
+              ansible.builtin.include_tasks:
+                file: webstack_vhost.yml
+              vars:
+                name: myapp
+                docroot: /var/www/myapp
+                port: 8080
+        """
+        title = self._resolve_title_str(body, context)
+
+        # Build vars dict from resource attributes, skipping Puppet metaparameters
+        task_vars: dict[str, Any] = {"name": title}
+        for attr in body.attributes:
+            if attr.name in _PUPPET_METAPARAMS:
+                continue
+            try:
+                val = self._resolve_node(attr.value, context)
+                task_vars[attr.name] = val
+            except Exception:
+                task_vars[attr.name] = f"{{{{ {attr.name} }}}}"
+
+        # Derive task file name: webstack::vhost → webstack_vhost.yml
+        tasks_file = resource_type.replace("::", "_") + ".yml"
+
+        when = context.current_when
+        task: dict[str, Any] = {
+            "name": f"Include defined type {resource_type} for {title}",
+            "ansible.builtin.include_tasks": {"file": tasks_file},
+            "vars": task_vars,
+        }
+        if when:
+            task["when"] = when
+        return [task]
 
     # ── Node definitions ──────────────────────────────────────────────────────
 
@@ -682,7 +792,8 @@ class ManifestConverter:
                 title_node = ref.titles[0] if ref.titles else StringLiteral(value="?")
                 title = str(self._resolve_node(title_node, context))
                 key = f"__virtual__{ref.type_name.lower()}__{title}"
-                virtual_body = context.variables.get(key)
+                # L5: check local scope first, then shared cross-file dict
+                virtual_body = context.variables.get(key) or self._shared_virtual_resources.get(key)
                 if isinstance(virtual_body, ResourceBody):
                     new_tasks = self.registry.convert_resource(
                         ref.type_name.lower(), virtual_body, context
@@ -718,9 +829,16 @@ class ManifestConverter:
                 return self._handle_create_resources(fn, context)
 
             if fn.name == "fail":
-                msg = self._resolve_node(fn.arguments[0], context) if fn.arguments else "fail()"
-                context.warn(f"Puppet fail() call: \"{msg}\" — add ansible.builtin.fail task if needed")
-                return []
+                # M3: convert fail() to ansible.builtin.fail with when: preserved
+                msg = self._resolve_node(fn.arguments[0], context) if fn.arguments else "Puppet fail() — manual review needed"
+                msg_str = str(msg).strip('"\'')
+                task: dict[str, Any] = {
+                    "name": f"Assert: {msg_str[:60]}",
+                    "ansible.builtin.fail": {"msg": msg_str},
+                }
+                if context.current_when:
+                    task["when"] = context.current_when
+                return [task]
 
             if fn.name in ("hiera", "lookup"):
                 # Called as a statement (unusual) — ignore
@@ -813,11 +931,18 @@ class ManifestConverter:
                         context.require_collection(col)
 
             elif isinstance(receiver_val, list):
-                for item in receiver_val:
+                # Puppet supports two array .each signatures:
+                #   $arr.each |$val| { ... }            — 1 param
+                #   $arr.each |Integer $idx, Type $val| — 2 params (index, value)
+                for idx, item in enumerate(receiver_val):
                     iter_ctx = ConversionContext(puppet_version=context.puppet_version)
                     iter_ctx.variables = dict(context.variables)
-                    if params:
+                    if len(params) == 1:
                         iter_ctx.set_variable(params[0], item)
+                    elif len(params) >= 2:
+                        # First param is the index, second is the value
+                        iter_ctx.set_variable(params[0], idx)
+                        iter_ctx.set_variable(params[1], item)
                     self._walk_statements(block.body, iter_ctx, result, target)
                     for h in iter_ctx.handlers:
                         if not any(x["name"] == h["name"] for x in context.handlers):
@@ -826,23 +951,49 @@ class ManifestConverter:
                         context.require_collection(col)
 
             else:
-                # Dynamic receiver — emit a loop-based include_tasks
+                # Dynamic receiver — emit a loop-based task
                 receiver_str = self._node_to_str(stmt.receiver, context)
                 context.warn(
                     f".each loop on dynamic value '{receiver_str}' — "
                     f"inner body converted with loop variable. Manual review needed."
                 )
-                # Convert body with placeholder variables
+
+                # Detect whether the receiver is array- or hash-typed so we
+                # can emit the correct loop style.
+                is_array_receiver = _is_array_type_node(stmt.receiver)
+
                 loop_ctx = ConversionContext(puppet_version=context.puppet_version)
                 loop_ctx.variables = dict(context.variables)
-                if params:
-                    loop_ctx.set_variable(params[0], f"{{{{ item.key }}}}")
-                if len(params) >= 2:
-                    loop_ctx.set_variable(params[1], f"{{{{ item.value }}}}")
+                if is_array_receiver:
+                    # Array iteration: |$val| or |Integer $idx, Type $val|
+                    if len(params) == 1:
+                        loop_ctx.set_variable(params[0], "{{ item }}")
+                    elif len(params) >= 2:
+                        loop_ctx.set_variable(params[0], "{{ loop.index0 }}")
+                        loop_ctx.set_variable(params[1], "{{ item }}")
+                else:
+                    # Hash/dict iteration: |$key, $val|
+                    if params:
+                        loop_ctx.set_variable(params[0], "{{ item.key }}")
+                    if len(params) >= 2:
+                        loop_ctx.set_variable(params[1], "{{ item.value }}")
+
                 inner_tasks: list[dict[str, Any]] = []
                 self._walk_statements(block.body, loop_ctx, result, inner_tasks)
+
+                # Strip outer {{ }} from receiver_str — _node_to_str already
+                # wraps variables in Jinja2 braces, so we must not wrap again.
+                loop_var = receiver_str.strip()
+                if loop_var.startswith("{{") and loop_var.endswith("}}"):
+                    loop_var = loop_var[2:-2].strip()
+
+                if is_array_receiver:
+                    loop_expr = f"{{{{ {loop_var} }}}}"
+                else:
+                    loop_expr = f"{{{{ {loop_var} | dict2items }}}}"
+
                 for t in inner_tasks:
-                    t["loop"] = f"{{{{ {receiver_str} | dict2items }}}}"
+                    t["loop"] = loop_expr
                     target.append(t)
 
         except Exception as exc:
@@ -850,13 +1001,38 @@ class ManifestConverter:
 
     # ── Condition conversion ──────────────────────────────────────────────────
 
+    def _strip_jinja_for_when(self, val: Any) -> str:
+        """Strip {{ }} wrapper from a resolved value for embedding in a when: expression.
+
+        when: values are already in a Jinja2 expression context, so inner {{ }} are invalid.
+        """
+        s = str(val)
+        if s.startswith("{{") and s.endswith("}}"):
+            return s[2:-2].strip()
+        return s
+
     def _condition_to_when(self, node: PuppetNode, context: ConversionContext) -> str:
         """Recursively convert a Puppet condition node to an Ansible 'when' string."""
 
         if isinstance(node, BinaryOp):
+            op = node.operator
+
+            # H4: $var == undef  →  var is none  (idiomatic Jinja2)
+            if op == "==" and isinstance(node.right, UndefLiteral):
+                left = self._condition_to_when(node.left, context)
+                return f"{left} is none"
+            if op == "==" and isinstance(node.left, UndefLiteral):
+                right = self._condition_to_when(node.right, context)
+                return f"{right} is none"
+            if op == "!=" and isinstance(node.right, UndefLiteral):
+                left = self._condition_to_when(node.left, context)
+                return f"{left} is not none"
+            if op == "!=" and isinstance(node.left, UndefLiteral):
+                right = self._condition_to_when(node.right, context)
+                return f"{right} is not none"
+
             left  = self._condition_to_when(node.left,  context)
             right = self._condition_to_when(node.right, context)
-            op    = node.operator
 
             _op_map = {
                 "==": "==", "!=": "!=",
@@ -871,12 +1047,20 @@ class ManifestConverter:
             if op in ("=~", "!~"):
                 pattern = (
                     node.right.pattern if isinstance(node.right, RegexLiteral)
-                    else str(self._resolve_node(node.right, context))
+                    else self._strip_jinja_for_when(self._resolve_node(node.right, context))
                 )
                 return f"{left} {ansible_op}('{pattern}')"
             return f"{left} {ansible_op} {right}"
 
         if isinstance(node, UnaryOp):
+            # M2: simplify double-negation: not (a == b) → a != b, not (a != b) → a == b
+            if isinstance(node.operand, BinaryOp):
+                inner_op = node.operand.operator
+                if inner_op in ("==", "!="):
+                    flipped = "!=" if inner_op == "==" else "=="
+                    left  = self._condition_to_when(node.operand.left,  context)
+                    right = self._condition_to_when(node.operand.right, context)
+                    return f"{left} {flipped} {right}"
             operand = self._condition_to_when(node.operand, context)
             return f"not ({operand})"
 
@@ -906,7 +1090,7 @@ class ManifestConverter:
             if node.name in ("hiera", "lookup") and node.arguments:
                 key = self._resolve_node(node.arguments[0], context)
                 return str(key).replace("::", "_")
-            return str(self._resolve_node(node, context))
+            return self._strip_jinja_for_when(self._resolve_node(node, context))
 
         if isinstance(node, MethodCall):
             # e.g. $array.empty? → variable | length == 0
@@ -921,8 +1105,8 @@ class ManifestConverter:
             items = [self._condition_to_when(e, context) for e in node.elements]
             return "[" + ", ".join(items) + "]"
 
-        # Fallback
-        return self._node_to_str(node, context)
+        # Fallback — strip {{ }} since when: is already a Jinja2 expression context
+        return self._strip_jinja_for_when(self._node_to_str(node, context))
 
     def _var_to_when(self, var: Variable) -> str:
         """Convert a Puppet variable reference to an Ansible fact or variable name."""
@@ -944,6 +1128,16 @@ class ManifestConverter:
         return "ansible_" + "_".join(keys)
 
     def _negate_condition(self, when: str) -> str:
+        # M2: simplify negation of simple equality/inequality at the string level.
+        # This handles unless-generated negations that can't go through AST UnaryOp.
+        # Pattern: "left == right" → "left != right" (and vice-versa).
+        import re as _re
+        eq_m  = _re.fullmatch(r'(.+?) == (.+)', when.strip())
+        neq_m = _re.fullmatch(r'(.+?) != (.+)', when.strip())
+        if eq_m:
+            return f"{eq_m.group(1)} != {eq_m.group(2)}"
+        if neq_m:
+            return f"{neq_m.group(1)} == {neq_m.group(2)}"
         return f"not ({when})"
 
     # ── Node resolution ───────────────────────────────────────────────────────

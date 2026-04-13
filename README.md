@@ -179,6 +179,8 @@ ansible-project/
 | `ini_setting` | `community.general.ini_file` |
 | `concat` / `concat::fragment` | `ansible.builtin.assemble` + `copy` to staging dir |
 | `tidy` | `ansible.builtin.find` + `ansible.builtin.file` |
+| `sysctl` | `ansible.posix.sysctl` |
+| `mysql::db` | `community.mysql.mysql_db` |
 | `notify` (resource) | `ansible.builtin.debug` |
 | ERB templates | Jinja2 (variables, loops, conditionals, Ruby method → filter) |
 | Hiera `lookup()` / `hiera()` | Resolved at conversion time; unresolved → Ansible var |
@@ -210,10 +212,19 @@ p2a convert-all /etc/puppet/ --puppet-version 3 -o output/
 
 ---
 
+## Parser resilience
+
+p2a is designed to handle real-world Puppet code, which is often imperfect:
+
+- **Stray trailing `}`** — manifests with an extra closing brace after the class body are automatically recovered. p2a strips the trailing `}` and re-parses, emitting a warning. The conversion continues normally.
+- **Graceful degradation** — any resource or construct that cannot be automatically converted produces a `# TODO` task with the original Puppet code instead of crashing. The output is always syntactically valid YAML.
+
+---
+
 ## Development
 
 ```bash
-# Tests
+# Tests (200 tests)
 pytest
 
 # Lint

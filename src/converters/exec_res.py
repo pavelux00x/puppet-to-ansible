@@ -7,7 +7,9 @@ from typing import Any
 from src.converters.base import BaseConverter, ConversionContext
 from src.parser.ast_nodes import ResourceBody
 
-_SHELL_CHARS = re.compile(r'[|><;]|&&|\|\|')
+_SHELL_CHARS   = re.compile(r'[|><;]|&&|\|\|')
+_MYSQL_PATTERN = re.compile(r'\b(mysql|mysqladmin|mysqldump|mysqlcheck)\b', re.I)
+_PSQL_PATTERN  = re.compile(r'\b(psql|pg_dump|pg_restore|createdb|dropdb|createuser)\b', re.I)
 
 
 class ExecConverter(BaseConverter):
@@ -168,12 +170,56 @@ class ExecConverter(BaseConverter):
                 main_task["register"] = "result"
 
         tasks.append(main_task)
+
+        # M5: detect DB CLI patterns and suggest idiomatic Ansible modules
+        if _MYSQL_PATTERN.search(command):
+            context.warn(
+                f"exec[{title}] runs a MySQL command — consider replacing with "
+                f"community.mysql.mysql_db or community.mysql.mysql_user for idiomatic Ansible. "
+                f"Add 'community.mysql' to requirements.yml if you adopt those modules."
+            )
+        elif _PSQL_PATTERN.search(command):
+            context.warn(
+                f"exec[{title}] runs a PostgreSQL command — consider replacing with "
+                f"community.postgresql.postgresql_db or .postgresql_user for idiomatic Ansible. "
+                f"Add 'community.postgresql' to requirements.yml if you adopt those modules."
+            )
+
         return tasks
 
 
 def _exec_to_handler_name(title: str, command: str) -> str:
-    """Generate a handler name for a refreshonly exec."""
-    return f"Run {title}"
+    """Generate a meaningful handler name for a refreshonly exec.
+
+    Derives a verb (Reload / Restart / Update / Run) from the title or command,
+    then uses the cleaned title as the subject — so 'auditctl-reload' becomes
+    'Reload auditctl' rather than the generic 'Run auditctl-reload'.
+    """
+    title_lower = title.lower()
+    cmd_lower   = (command.lower().split()[0] if command.strip() else "").split("/")[-1]
+
+    # Determine action verb from title keywords first, then command name
+    if "reload" in title_lower or cmd_lower in ("systemctl", "service") and "reload" in command.lower():
+        action = "Reload"
+        suffix = re.sub(r'[-_]?reload[-_]?', '', title, flags=re.I)
+    elif "restart" in title_lower or cmd_lower in ("systemctl", "service") and "restart" in command.lower():
+        action = "Restart"
+        suffix = re.sub(r'[-_]?restart[-_]?', '', title, flags=re.I)
+    elif "update" in title_lower or cmd_lower in ("apt-get", "yum", "dnf") and "update" in command.lower():
+        action = "Update"
+        suffix = re.sub(r'[-_]?update[-_]?', '', title, flags=re.I)
+    elif "start" in title_lower:
+        action = "Start"
+        suffix = re.sub(r'[-_]?start[-_]?', '', title, flags=re.I)
+    elif "stop" in title_lower:
+        action = "Stop"
+        suffix = re.sub(r'[-_]?stop[-_]?', '', title, flags=re.I)
+    else:
+        action = "Run"
+        suffix = title
+
+    suffix = suffix.strip("-_ ") or title
+    return f"{action} {suffix}"
 
 
 def _safe_var_name(s: str) -> str:
