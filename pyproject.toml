@@ -1,6 +1,6 @@
 [project]
 name = "puppet-to-ansible"
-version = "0.1.1"
+version = "0.1.2"
 description = "Convert Puppet manifests to Ansible playbooks and roles"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -33,6 +33,9 @@ lint = [
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"*" = ["*.lark"]
 
 [project.scripts]
 p2a = "puppet_to_ansible.cli:main"
