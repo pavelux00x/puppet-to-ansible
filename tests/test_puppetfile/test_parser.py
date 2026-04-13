@@ -1,7 +1,7 @@
 """Tests for Puppetfile parser."""
 from pathlib import Path
 import pytest
-from src.puppetfile.parser import PuppetfileParser, PuppetModule
+from puppet_to_ansible.puppetfile.parser import PuppetfileParser, PuppetModule
 
 FIXTURE = Path(__file__).parent.parent / "fixtures" / "input" / "Puppetfile"
 

@@ -5,9 +5,9 @@ from pathlib import Path
 
 import pytest
 
-from src.converters.manifest_converter import ManifestConverter
-from src.generators.playbook import PlaybookGenerator, RoleGenerator
-from src.parser.parser import _parsers, parse, parse_file
+from puppet_to_ansible.converters.manifest_converter import ManifestConverter
+from puppet_to_ansible.generators.playbook import PlaybookGenerator, RoleGenerator
+from puppet_to_ansible.parser.parser import _parsers, parse, parse_file
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 INPUT_DIR    = FIXTURES_DIR / "input"
