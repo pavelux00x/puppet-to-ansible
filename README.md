@@ -5,12 +5,13 @@ Convert Puppet manifests, modules, and entire codebases into production-ready An
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue?logo=python&logoColor=white)
 ![License](https://img.shields.io/badge/license-MIT-lightgrey)
 
+* 100% Local Execution
 ---
 
 ## Install
 
 ```bash
-git clone https://github.com/your-org/puppet-to-ansible.git
+git clone https://github.com/pavelux00x/puppet-to-ansible.git
 cd puppet-to-ansible
 pip install -e .
 ```
