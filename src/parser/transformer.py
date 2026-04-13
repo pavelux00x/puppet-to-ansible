@@ -188,7 +188,7 @@ class PuppetTransformer(Transformer):
             elif isinstance(item, str) and "::" in item or (isinstance(item, str) and re.match(r"^[a-z]", item)):
                 parent = item
             elif isinstance(item, list):
-                body = [s for s in item if s is not None]
+                body.extend(s for s in item if s is not None)
             elif isinstance(item, PuppetNode):
                 body.append(item)
         return ClassDefinition(name=name, parameters=params, parent=parent, body=body)
@@ -233,7 +233,7 @@ class PuppetTransformer(Transformer):
             if isinstance(item, list) and item and isinstance(item[0], ClassParameter):
                 params = item
             elif isinstance(item, list):
-                body = [s for s in item if s is not None]
+                body.extend(s for s in item if s is not None)
             elif isinstance(item, PuppetNode):
                 body.append(item)
         return DefinedTypeDefinition(name=name, parameters=params, body=body)

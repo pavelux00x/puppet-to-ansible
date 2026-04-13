@@ -68,6 +68,21 @@ def _map_variable(puppet_var: str) -> str:
     return var.replace("::", "_")
 
 
+def _normalize_multiline_tags(text: str) -> str:
+    """Collapse multi-line ERB tags into single lines.
+
+    Tags like ``<% if a &&\\n   b %>`` span multiple lines and break the
+    line-by-line converter.  Replace newlines *inside* ``<% ... %>`` blocks
+    with a single space so each tag fits on one physical line.
+    """
+    return re.sub(
+        r"<%(?!>)(.*?)%>",
+        lambda m: "<%" + m.group(1).replace("\n", " ") + "%>",
+        text,
+        flags=re.DOTALL,
+    )
+
+
 class ErbConverter:
     """Converts an ERB template string to Jinja2 format."""
 
@@ -77,7 +92,11 @@ class ErbConverter:
         Returns a ConversionOutput with the converted content and any warnings.
         """
         output = ConversionOutput()
-        lines = erb_content.split("\n")
+        # Normalize multi-line ERB tags before splitting into lines.
+        # Tags like <% if a &&\n   b %> confuse the line-by-line processor;
+        # collapse internal newlines to a space so each tag fits on one line.
+        normalized = _normalize_multiline_tags(erb_content)
+        lines = normalized.split("\n")
         result_lines = []
 
         for i, line in enumerate(lines, start=1):

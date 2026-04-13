@@ -61,8 +61,38 @@ class PackageConverter(BaseConverter):
         notify = self.get_notify(body, context)
         when   = self.get_when(body, context)
 
+        title_list = titles if isinstance(titles, list) else [titles]
+
+        # M1: when multiple packages share the same state/provider and no version
+        # is pinned, emit a single task with name: [list] instead of one per item.
+        # Per-item tasks are still used for pip/gem/chocolatey (complex extras),
+        # for version-pinned installs, and for single-package declarations.
+        use_list_task = (
+            len(title_list) > 1
+            and not version
+            and module not in ("ansible.builtin.pip", "community.general.gem",
+                               "chocolatey.chocolatey.win_chocolatey")
+        )
+
+        if use_list_task:
+            action_word = "Remove" if state == "absent" else "Install"
+            pkg_names = [str(t) for t in title_list]
+            task_name = f"{action_word} {', '.join(pkg_names)}"
+            params: dict[str, Any] = {"name": pkg_names, "state": state}
+            if module == "ansible.builtin.apt":
+                update_cache = body.get_attr("update_cache")
+                if update_cache is None:
+                    params["update_cache"] = True
+            return [self.make_task(
+                name=task_name,
+                module=module,
+                params=params,
+                notify=notify or None,
+                when=when,
+            )]
+
         tasks = []
-        for pkg_name in titles if isinstance(titles, list) else [titles]:
+        for pkg_name in title_list:
             pkg_name_str = str(pkg_name)
             # If version is pinned, append to name for apt/yum style
             if version and module in ("ansible.builtin.apt", "ansible.builtin.yum", "ansible.builtin.dnf"):
@@ -73,20 +103,20 @@ class PackageConverter(BaseConverter):
             action_word = "Remove" if state == "absent" else "Install"
             task_name = f"{action_word} {pkg_name}"
 
-            params: dict[str, Any] = {"name": pkg_name_str, "state": state}
+            params_single: dict[str, Any] = {"name": pkg_name_str, "state": state}
 
             # Provider-specific extras
             if module == "ansible.builtin.pip":
-                params = self._pip_params(body, context, pkg_name_str, state)
+                params_single = self._pip_params(body, context, pkg_name_str, state)
             elif module == "ansible.builtin.apt":
                 update_cache = body.get_attr("update_cache")
                 if update_cache is None:
-                    params["update_cache"] = True  # idiomatic for apt
+                    params_single["update_cache"] = True  # idiomatic for apt
 
             tasks.append(self.make_task(
                 name=task_name,
                 module=module,
-                params=params,
+                params=params_single,
                 notify=notify or None,
                 when=when,
             ))

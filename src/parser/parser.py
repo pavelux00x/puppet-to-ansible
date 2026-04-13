@@ -59,6 +59,23 @@ class ParseError(Exception):
         return f"{super().__str__()}{loc}{ctx}"
 
 
+def _candidate_sources_without_trailing_brace(source: str) -> list[str]:
+    """Yield candidate sources obtained by removing one trailing '}' at a time.
+
+    Returns a list (up to 3 candidates) so the caller can retry parsing on each.
+    Each candidate removes one more trailing '}' than the previous.
+    Stops early if no more trailing '}' can be removed.
+    """
+    candidates: list[str] = []
+    current = source.rstrip()
+    for _ in range(3):
+        if not current.endswith("}"):
+            break
+        current = current[:-1].rstrip()
+        candidates.append(current)
+    return candidates
+
+
 def parse(
     source: str,
     source_file: str = "<string>",
@@ -81,27 +98,44 @@ def parse(
     parser = get_parser(puppet_version)
     transformer = PuppetTransformer()
 
-    try:
-        tree = parser.parse(source)
-    except UnexpectedCharacters as e:
-        raise ParseError(
-            f"Unexpected character in {source_file}",
-            line=e.line,
-            col=e.column,
-            context=e.get_context(source, span=40),
-        ) from e
-    except UnexpectedEOF as e:
-        raise ParseError(
-            f"Unexpected end of file in {source_file} — "
-            f"expected one of: {[str(t) for t in e.expected[:5]]}",
-        ) from e
-    except UnexpectedToken as e:
-        raise ParseError(
-            f"Unexpected token '{e.token}' in {source_file}",
-            line=e.line,
-            col=e.column,
-            context=e.get_context(source, span=40),
-        ) from e
+    def _do_parse(src: str) -> object:
+        try:
+            return parser.parse(src)
+        except UnexpectedCharacters as e:
+            # Try to recover: when there's a stray `}`, try removing one
+            # trailing `}` at a time and retrying (up to 3 attempts).
+            if str(e.char) == "}":
+                for candidate in _candidate_sources_without_trailing_brace(src):
+                    try:
+                        tree = parser.parse(candidate)
+                        logger.warning(
+                            "Recovered from stray trailing '}' in %s — "
+                            "the source file has an extra closing brace.",
+                            source_file,
+                        )
+                        return tree
+                    except (UnexpectedCharacters, UnexpectedEOF, UnexpectedToken):
+                        continue  # Try stripping one more `}`
+            raise ParseError(
+                f"Unexpected character in {source_file}",
+                line=e.line,
+                col=e.column,
+                context=e.get_context(src, span=40),
+            ) from e
+        except UnexpectedEOF as e:
+            raise ParseError(
+                f"Unexpected end of file in {source_file} — "
+                f"expected one of: {[str(t) for t in e.expected[:5]]}",
+            ) from e
+        except UnexpectedToken as e:
+            raise ParseError(
+                f"Unexpected token '{e.token}' in {source_file}",
+                line=e.line,
+                col=e.column,
+                context=e.get_context(src, span=40),
+            ) from e
+
+    tree = _do_parse(source)
 
     try:
         manifest: Manifest = transformer.transform(tree)

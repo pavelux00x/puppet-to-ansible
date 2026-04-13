@@ -240,10 +240,12 @@ def convert_module_cmd(
     hiera_res = _build_hiera(hiera, str(mod_path / "manifests" / "init.pp"), mpath)
 
     # Use preprocessor to get ordered file list (init.pp first)
+    known_defined_types: set[str] = set()
     try:
         pre = ManifestPreprocessor(module_paths=mpath, puppet_version=pv)
         pre_result = pre.resolve_module(mod_path)
         pp_files = pre_result.manifest_paths
+        known_defined_types = set(pre_result.defined_type_sources.keys())
         for w in pre_result.warnings:
             console.print(f"  [dim]preprocessor:[/dim] {w}")
     except (NotADirectoryError, FileNotFoundError):
@@ -262,7 +264,10 @@ def convert_module_cmd(
     for pp_file in pp_files:
         try:
             ast = parse_file(pp_file, puppet_version=pv)
-            conv = ManifestConverter(puppet_version=pv, hiera_resolver=hiera_res, module_paths=mpath)
+            conv = ManifestConverter(
+                puppet_version=pv, hiera_resolver=hiera_res, module_paths=mpath,
+                known_defined_types=known_defined_types,
+            )
             r = conv.convert(ast)
             results.append(r)
             rb.add_file_result(str(pp_file), r)
@@ -388,11 +393,31 @@ def convert_all_cmd(
         console.print(f"\n[bold]site.pp → site.yml + inventory[/bold]")
         manifest_paths = _resolve_includes(str(site_pp), list(modules_dirs), pv, verbose)
 
+        # Collect all defined type names from every module so call sites
+        # in site.pp (or included manifests) generate include_tasks correctly.
+        # modules_dirs contains module ROOT dirs (e.g. .../modules/), so we
+        # must enumerate their subdirectories to get individual module dirs.
+        site_known_defined_types: set[str] = set()
+        for mod_root in modules_dirs:
+            mod_root_path = Path(mod_root)
+            for mod_subdir in sorted(mod_root_path.iterdir()):
+                if mod_subdir.is_dir() and (mod_subdir / "manifests").is_dir():
+                    try:
+                        _pre = ManifestPreprocessor(module_paths=list(modules_dirs), puppet_version=pv)
+                        _pr = _pre.resolve_module(mod_subdir)
+                        site_known_defined_types.update(_pr.defined_type_sources.keys())
+                    except Exception:
+                        pass
+
         results: list[ConversionResult] = []
         for mp in manifest_paths:
             try:
                 ast = parse_file(mp, puppet_version=pv)
-                conv = ManifestConverter(puppet_version=pv, hiera_resolver=hiera_res, module_paths=list(modules_dirs))
+                conv = ManifestConverter(
+                    puppet_version=pv, hiera_resolver=hiera_res,
+                    module_paths=list(modules_dirs),
+                    known_defined_types=site_known_defined_types,
+                )
                 r = conv.convert(ast)
                 results.append(r)
                 rb.add_file_result(str(mp), r)
@@ -696,11 +721,26 @@ def _convert_one_module(
     if not pp_files:
         return None
 
+    # Pre-scan for defined type names so call sites can emit include_tasks.
+    # We only use defined_type_sources here — NOT manifest_paths, because
+    # the preprocessor follows cross-module includes which would cause
+    # double-conversion of resources from other modules.
+    known_defined_types: set[str] = set()
+    try:
+        pre = ManifestPreprocessor(module_paths=module_paths, puppet_version=pv)
+        pre_result = pre.resolve_module(mod_dir)
+        known_defined_types = set(pre_result.defined_type_sources.keys())
+    except Exception:
+        pass  # Non-critical: fall back to no pre-known types
+
     results: list[ConversionResult] = []
     for pp_file in pp_files:
         try:
             ast = parse_file(pp_file, puppet_version=pv)
-            conv = ManifestConverter(puppet_version=pv, hiera_resolver=hiera_res, module_paths=module_paths)
+            conv = ManifestConverter(
+                puppet_version=pv, hiera_resolver=hiera_res, module_paths=module_paths,
+                known_defined_types=known_defined_types,
+            )
             r = conv.convert(ast)
             results.append(r)
             if rb:

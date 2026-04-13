@@ -64,3 +64,26 @@ class TestPackageConverter:
         t = r.tasks[0]
         keys = [k for k in t if k != "name"]
         assert any(k.startswith("ansible.") for k in keys), f"No FQCN in {t}"
+
+    # M1 — array title → single list task
+    def test_array_title_emits_single_task(self):
+        """M1: package { ['a', 'b', 'c']: ensure => installed } → one task with name list."""
+        src = "package { ['mysql-server', 'mysql-client', 'python3-mysqldb']: ensure => installed }"
+        r = convert_snippet(src)
+        assert len(r.tasks) == 1
+        pkg = r.tasks[0]["ansible.builtin.package"]
+        assert isinstance(pkg["name"], list)
+        assert pkg["name"] == ["mysql-server", "mysql-client", "python3-mysqldb"]
+        assert pkg["state"] == "present"
+
+    def test_array_title_version_pinned_stays_individual(self):
+        """When version is pinned, array titles stay as individual tasks."""
+        src = "package { ['nginx', 'curl']: ensure => '1.24.0' }"
+        r = convert_snippet(src)
+        assert len(r.tasks) == 2
+
+    def test_array_title_pip_stays_individual(self):
+        """pip provider with array title emits individual tasks (complex extras)."""
+        src = "package { ['flask', 'requests']: ensure => installed, provider => pip }"
+        r = convert_snippet(src)
+        assert len(r.tasks) == 2

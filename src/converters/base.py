@@ -25,6 +25,17 @@ from src.parser.ast_nodes import (
 from src.utils.facts_mapper import map_fact
 
 
+def _looks_like_expression(name: str) -> bool:
+    """Return True if a Variable.name is actually a complex expression.
+
+    The Puppet parser sometimes stores ``${pick($x, 'y')}`` inside a string
+    interpolation as a Variable whose name is the raw expression text.
+    We detect this by looking for characters that can't appear in a plain
+    Puppet variable name.
+    """
+    return "(" in name or "[" in name or " " in name
+
+
 class BaseConverter(ABC):
     """Abstract base class for Puppet-to-Ansible resource converters.
 
@@ -110,8 +121,15 @@ class BaseConverter(ABC):
             if isinstance(part, str):
                 parts.append(part)
             elif isinstance(part, Variable):
-                resolved = self._resolve_variable(part, context)
-                # If already a jinja2 expression, embed directly
+                # The Puppet parser sometimes treats ${complex_expr} inside
+                # double-quoted strings as a Variable with the raw expression
+                # as its name (e.g. name="pick($x, 'default')").
+                # Detect this and re-parse the expression so it gets properly resolved.
+                if _looks_like_expression(part.name):
+                    resolved = self._resolve_expression_string(part.name, context)
+                else:
+                    resolved = self._resolve_variable(part, context)
+                # Embed Jinja2 expressions directly; stringify everything else
                 if isinstance(resolved, str) and resolved.startswith("{{"):
                     parts.append(resolved)
                 else:
@@ -120,8 +138,30 @@ class BaseConverter(ABC):
                 val = self.resolve(part, context)
                 parts.append(str(val))
         result = "".join(parts)
-        # Wrap in quotes if the result contains jinja2 expressions
         return result
+
+    def _resolve_expression_string(self, expr: str, context: ConversionContext) -> Any:
+        """Try to re-parse a raw Puppet expression string and resolve it.
+
+        Used when the parser embeds a complex expression (e.g. ``pick($x, 'y')``)
+        as a Variable name inside a string interpolation.
+        Falls back to a Jinja2 placeholder if parsing fails.
+        """
+        try:
+            from src.parser.parser import parse
+            # Wrap in a minimal manifest so the parser can handle an expression
+            wrapper = f'$__expr__ = ({expr})'
+            ast = parse(wrapper, puppet_version=context.puppet_version)
+            if ast.statements:
+                stmt = ast.statements[0]
+                from src.parser.ast_nodes import VariableAssignment
+                if isinstance(stmt, VariableAssignment):
+                    return self.resolve(stmt.value, context)
+        except Exception:
+            pass
+        # Fallback: return as Jinja2 placeholder with best-effort sanitisation
+        clean = expr.replace("::", "_")
+        return f"{{{{ {clean} }}}}"
 
     def _resolve_function(self, fn: FunctionCall, context: ConversionContext) -> Any:
         name = fn.name
@@ -176,21 +216,134 @@ class BaseConverter(ABC):
         if name in ("hiera_array", "hiera_hash"):
             if fn.arguments:
                 key = self.resolve(fn.arguments[0], context)
-                var_name = str(key).replace("::", "_")
+                var_name = str(key).replace("::", "_").replace("-", "_").replace(".", "_")
+                # L3: seed defaults/main.yml with an empty placeholder so the var
+                # exists even when no Hiera data directory is present at runtime.
+                if hasattr(context, "hiera_defaults"):
+                    empty: Any = [] if name == "hiera_array" else {}
+                    context.hiera_defaults.setdefault(var_name, empty)
                 return f"{{{{ {var_name} }}}}"
             return "[]"
         if name == "fail":
             return None  # fail() calls are ignored in conversion (generate warning)
+        if name == "__index__":
+            # Hash/array subscript: $hash['key'] or $arr[0]
+            base = self.resolve(fn.arguments[0], context) if fn.arguments else ""
+            key  = self.resolve(fn.arguments[1], context) if len(fn.arguments) >= 2 else ""
+
+            # If the base is a statically-resolved Python dict or list, index it
+            # directly rather than emitting a Jinja2 subscript expression.
+            if isinstance(base, dict):
+                return base.get(str(key))
+            if isinstance(base, list):
+                try:
+                    return base[int(key)]
+                except (ValueError, IndexError):
+                    pass
+
+            base_str = str(base)
+            key_str  = str(key)
+            # Strip outer {{ }} so we don't produce {{ {{ expr }}["key"] }}
+            if base_str.startswith("{{") and base_str.endswith("}}"):
+                inner = base_str[2:-2].strip()
+                return f'{{{{ {inner}["{key_str}"] }}}}'
+            return f'{{{{ {base_str}["{key_str}"] }}}}'
+        if name == "pick":
+            # stdlib pick($a, $b, ...) — return first defined non-empty value.
+            # Convert to Jinja2 chained | default() filters.
+            if not fn.arguments:
+                return "{{ omit }}"
+            vals = [self.resolve(a, context) for a in fn.arguments]
+
+            def _strip_jinja(v: Any) -> str:
+                s = str(v)
+                if s.startswith("{{") and s.endswith("}}"):
+                    return s[2:-2].strip()
+                # Literal string — quote it
+                return f'"{s}"'
+
+            if len(vals) == 1:
+                return f"{{{{ {_strip_jinja(vals[0])} }}}}"
+            # Build chained defaults: {{ a | default(b) | default(c) ... }}
+            chain = _strip_jinja(vals[0])
+            for v in vals[1:]:
+                chain += f" | default({_strip_jinja(v)})"
+            return f"{{{{ {chain} }}}}"
+        if name in ("any2array", "flatten"):
+            # stdlib list helpers — pass through as Jinja2 filter
+            if fn.arguments:
+                val = self.resolve(fn.arguments[0], context)
+                val_str = str(val)
+                if val_str.startswith("{{") and val_str.endswith("}}"):
+                    inner = val_str[2:-2].strip()
+                    return f"{{{{ [{inner}] | flatten }}}}"
+                return f"{{{{ [{val_str}] | flatten }}}}"
+            return "[]"
+        if name == "regsubst":
+            # regsubst($str, $pattern, $replacement, $flags) → regex_replace filter
+            if len(fn.arguments) >= 3:
+                s   = self.resolve(fn.arguments[0], context)
+                pat = self.resolve(fn.arguments[1], context)
+                rep = self.resolve(fn.arguments[2], context)
+                s_str = str(s)
+                if s_str.startswith("{{") and s_str.endswith("}}"):
+                    inner = s_str[2:-2].strip()
+                    return f"{{{{ {inner} | regex_replace('{pat}', '{rep}') }}}}"
+                return f"{{{{ '{s_str}' | regex_replace('{pat}', '{rep}') }}}}"
+        if name == "empty":
+            # stdlib empty($x) → x | length == 0
+            if fn.arguments:
+                val = self.resolve(fn.arguments[0], context)
+                val_str = str(val)
+                if val_str.startswith("{{") and val_str.endswith("}}"):
+                    inner = val_str[2:-2].strip()
+                    return f"{{{{ {inner} | length == 0 }}}}"
+        if name == "defined":
+            # defined($x) → x is defined
+            if fn.arguments:
+                val = self.resolve(fn.arguments[0], context)
+                val_str = str(val)
+                if val_str.startswith("{{") and val_str.endswith("}}"):
+                    inner = val_str[2:-2].strip()
+                    return f"{{{{ {inner} is defined }}}}"
         # Generic function → Jinja2 filter-style representation
         args_repr = ", ".join(str(self.resolve(a, context)) for a in fn.arguments)
         return f"{{{{ {name}({args_repr}) }}}}"
 
     def _resolve_selector(self, sel: SelectorExpression, context: ConversionContext) -> Any:
         control_val = self.resolve(sel.control, context)
+
+        # First, try to statically evaluate if the control is a literal string/bool/number
+        static_ctrl = None
+        from src.parser.ast_nodes import StringLiteral, NumberLiteral, BoolLiteral
+        if isinstance(sel.control, (StringLiteral, NumberLiteral, BoolLiteral)):
+            static_ctrl = str(sel.control.value).lower() if isinstance(sel.control, BoolLiteral) else sel.control.value
+
+        if static_ctrl is not None:
+            for match, result in sel.cases:
+                if isinstance(match, UndefLiteral):
+                    continue  # default — handled last
+                match_val = self.resolve(match, context)
+                if str(match_val) == str(static_ctrl):
+                    return self.resolve(result, context)
+            # No case matched — fall through to default
+
+        # Return the default case value if present (prevents garbage YAML)
+        default_result = None
         for match, result in sel.cases:
             if isinstance(match, UndefLiteral):
-                return self.resolve(result, context)  # default
-        # Can't statically resolve — return as comment
+                default_result = self.resolve(result, context)
+                break
+
+        if default_result is not None:
+            return default_result
+
+        # No default case — return first non-default case value with a warning
+        for match, result in sel.cases:
+            if not isinstance(match, UndefLiteral):
+                return self.resolve(result, context)
+
+        # Truly empty selector — last resort fallback
         return f"# selector on {control_val}"
 
     def resolve_title(self, body: ResourceBody, context: ConversionContext) -> str | list[str]:
